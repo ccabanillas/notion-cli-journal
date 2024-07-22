@@ -15,14 +15,27 @@ load_dotenv()
 # Initialize Notion client
 notion = Client(auth=os.getenv("NOTION_TOKEN"))
 
-def derive_key(password: str) -> bytes:
+def derive_key(password: str, salt: bytes) -> bytes:
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
-        salt=b'fixed_salt',  # In a real app, use a random salt and store it
+        salt=salt,
         iterations=100000,
     )
     return base64.urlsafe_b64encode(kdf.derive(password.encode()))
+
+def encrypt_entry(password: str, entry: str) -> tuple:
+    salt = os.urandom(16)
+    key = derive_key(password, salt)
+    f = Fernet(key)
+    encrypted_entry = f.encrypt(entry.encode())
+    return salt + encrypted_entry
+
+def decrypt_entry(password: str, encrypted_data: bytes) -> str:
+    salt, encrypted_entry = encrypted_data[:16], encrypted_data[16:]
+    key = derive_key(password, salt)
+    f = Fernet(key)
+    return f.decrypt(encrypted_entry).decode()
 
 @click.group()
 def cli():
@@ -33,87 +46,66 @@ def cli():
 @click.option('--password', prompt=True, hide_input=True, confirmation_prompt=True, help='Password for encryption.')
 def add(entry, password):
     try:
-        key = derive_key(password)
-        f = Fernet(key)
-
-        encrypted_entry = f.encrypt(entry.encode()).decode()
+        encrypted_data = encrypt_entry(password, entry)
+        encrypted_entry_base64 = base64.b64encode(encrypted_data).decode()
 
         new_page = notion.pages.create(
             parent={"database_id": os.getenv("NOTION_DATABASE_ID")},
             properties={
                 "Title": {"title": [{"text": {"content": f"Journal Entry - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}}]},
-                "Content": {"rich_text": [{"text": {"content": encrypted_entry}}]}
+                "Content": {"rich_text": [{"text": {"content": encrypted_entry_base64}}]}
             }
         )
 
         click.echo(f'Entry added to Notion. Page ID: {new_page["id"]}')
     except Exception as e:
         click.echo(f"An error occurred: {str(e)}")
+        click.echo(traceback.format_exc())
 
 @cli.command()
 @click.option('--password', prompt=True, hide_input=True, help='Password for decryption.')
 def list(password):
     try:
-        # Check if the NOTION_TOKEN is set
-        if not os.getenv("NOTION_TOKEN"):
-            raise ValueError("NOTION_TOKEN is not set in the environment variables.")
-
-        # Check if the NOTION_DATABASE_ID is set
-        if not os.getenv("NOTION_DATABASE_ID"):
-            raise ValueError("NOTION_DATABASE_ID is not set in the environment variables.")
-
-        key = derive_key(password)
-        f = Fernet(key)
-
         pages = notion.databases.query(
             database_id=os.getenv("NOTION_DATABASE_ID"),
             sorts=[{"property": "Title", "direction": "descending"}]
         ).get("results")
 
-        if not pages:
-            click.echo("No entries found in the database.")
-            return
-
         for page in pages:
             title = page["properties"]["Title"]["title"][0]["text"]["content"]
-            encrypted_content = page["properties"]["Content"]["rich_text"][0]["text"]["content"]
+            encrypted_content_base64 = page["properties"]["Content"]["rich_text"][0]["text"]["content"]
+            encrypted_content = base64.b64decode(encrypted_content_base64)
+            
             try:
-                decrypted_content = f.decrypt(encrypted_content.encode()).decode()
+                decrypted_content = decrypt_entry(password, encrypted_content)
+                click.echo(f"\n{title}")
+                click.echo(f"Content: {decrypted_content[:50]}...")  # Show first 50 characters
+                click.echo(f"Page ID: {page['id']}")
             except Exception as decrypt_error:
                 click.echo(f"Failed to decrypt entry '{title}': {str(decrypt_error)}")
-                continue
 
-            click.echo(f"\n{title}")
-            click.echo(f"Content: {decrypted_content[:50]}...")  # Show first 50 characters
-            click.echo(f"Page ID: {page['id']}")
-
-    except ValueError as ve:
-        click.echo(f"Configuration error: {str(ve)}")
     except Exception as e:
         click.echo(f"An error occurred: {str(e)}")
-        click.echo("Detailed error information:")
         click.echo(traceback.format_exc())
-
 
 @cli.command()
 @click.option('--page-id', prompt='Page ID', help='The ID of the page to read.')
 @click.option('--password', prompt=True, hide_input=True, help='Password for decryption.')
 def read(page_id, password):
     try:
-        key = derive_key(password)
-        f = Fernet(key)
-
         page = notion.pages.retrieve(page_id=page_id)
         title = page["properties"]["Title"]["title"][0]["text"]["content"]
-        encrypted_content = page["properties"]["Content"]["rich_text"][0]["text"]["content"]
+        encrypted_content_base64 = page["properties"]["Content"]["rich_text"][0]["text"]["content"]
+        encrypted_content = base64.b64decode(encrypted_content_base64)
         
-        decrypted_content = f.decrypt(encrypted_content.encode()).decode()
+        decrypted_content = decrypt_entry(password, encrypted_content)
         
         click.echo(f"\n{title}")
         click.echo(f"Content:\n{decrypted_content}")
 
     except Exception as e:
         click.echo(f"An error occurred: {str(e)}")
+        click.echo(traceback.format_exc())
 
 if __name__ == '__main__':
     cli()
