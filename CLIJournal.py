@@ -12,27 +12,42 @@ import traceback
 # Load environment variables
 load_dotenv()
 
+# Configuration
+SALT_LENGTH = 16
+ITERATIONS = 100000  # Consider moving this to .env if you want it configurable
+
 # Initialize Notion client
 notion = Client(auth=os.getenv("NOTION_TOKEN"))
 
 def derive_key(password: str, salt: bytes) -> bytes:
+    if not password:
+        raise ValueError("Password cannot be empty")
+    if len(salt) != SALT_LENGTH:
+        raise ValueError(f"Salt must be {SALT_LENGTH} bytes long")
+    
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
         length=32,
         salt=salt,
-        iterations=100000,
+        iterations=ITERATIONS,
     )
     return base64.urlsafe_b64encode(kdf.derive(password.encode()))
 
 def encrypt_entry(password: str, entry: str) -> tuple:
-    salt = os.urandom(16)
+    if not entry:
+        raise ValueError("Entry cannot be empty")
+    
+    salt = os.urandom(SALT_LENGTH)
     key = derive_key(password, salt)
     f = Fernet(key)
     encrypted_entry = f.encrypt(entry.encode())
     return salt + encrypted_entry
 
 def decrypt_entry(password: str, encrypted_data: bytes) -> str:
-    salt, encrypted_entry = encrypted_data[:16], encrypted_data[16:]
+    if len(encrypted_data) <= SALT_LENGTH:
+        raise ValueError("Encrypted data is too short")
+    
+    salt, encrypted_entry = encrypted_data[:SALT_LENGTH], encrypted_data[SALT_LENGTH:]
     key = derive_key(password, salt)
     f = Fernet(key)
     return f.decrypt(encrypted_entry).decode()
@@ -58,6 +73,8 @@ def add(entry, password):
         )
 
         click.echo(f'Entry added to Notion. Page ID: {new_page["id"]}')
+    except ValueError as ve:
+        click.echo(f"Validation error: {str(ve)}")
     except Exception as e:
         click.echo(f"An error occurred: {str(e)}")
         click.echo(traceback.format_exc())
@@ -103,6 +120,8 @@ def read(page_id, password):
         click.echo(f"\n{title}")
         click.echo(f"Content:\n{decrypted_content}")
 
+    except ValueError as ve:
+        click.echo(f"Validation error: {str(ve)}")
     except Exception as e:
         click.echo(f"An error occurred: {str(e)}")
         click.echo(traceback.format_exc())
