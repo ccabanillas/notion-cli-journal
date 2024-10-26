@@ -1,130 +1,178 @@
-import click
+import os
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from notion_client import Client
-import os
-from dotenv import load_dotenv
+import datetime
 import base64
-from datetime import datetime
-import traceback
+from getpass import getpass
+from dotenv import load_dotenv
 
-# Load environment variables
-load_dotenv()
-
-# Configuration
-SALT_LENGTH = 16
-ITERATIONS = 100000  # Consider moving this to .env if you want it configurable
-
-# Initialize Notion client
-notion = Client(auth=os.getenv("NOTION_TOKEN"))
-
-def derive_key(password: str, salt: bytes) -> bytes:
-    if not password:
-        raise ValueError("Password cannot be empty")
-    if len(salt) != SALT_LENGTH:
-        raise ValueError(f"Salt must be {SALT_LENGTH} bytes long")
+class EncryptedJournal:
+    BLOCK_CHAR_LIMIT = 2000
+    MAX_BLOCKS_PER_REQUEST = 100
     
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=ITERATIONS,
-    )
-    return base64.urlsafe_b64encode(kdf.derive(password.encode()))
+    def __init__(self, password):
+        """Initialize the journal with Notion credentials and encryption key"""
+        # Load environment variables
+        load_dotenv()
+        
+        # Get Notion credentials from environment
+        notion_token = os.getenv('NOTION_TOKEN')
+        database_id = os.getenv('NOTION_JOURNAL_DATABASE_ID')
+        
+        if not notion_token:
+            raise ValueError("Missing NOTION_TOKEN in environment variables")
+        if not database_id:
+            raise ValueError("Missing NOTION_JOURNAL_DATABASE_ID in environment variables")
+        
+        self.notion = Client(auth=notion_token)
+        self.database_id = database_id
+        
+        # Generate encryption key from password
+        self.salt = b'journal_salt_2024'
+        self.setup_encryption(password)
 
-def encrypt_entry(password: str, entry: str) -> tuple:
-    if not entry:
-        raise ValueError("Entry cannot be empty")
-    
-    salt = os.urandom(SALT_LENGTH)
-    key = derive_key(password, salt)
-    f = Fernet(key)
-    encrypted_entry = f.encrypt(entry.encode())
-    return salt + encrypted_entry
+    def setup_encryption(self, password):
+        """Set up encryption using password-based key derivation"""
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=self.salt,
+            iterations=480000,
+        )
+        key = base64.b64encode(kdf.derive(password.encode()))
+        self.cipher_suite = Fernet(key)
 
-def decrypt_entry(password: str, encrypted_data: bytes) -> str:
-    if len(encrypted_data) <= SALT_LENGTH:
-        raise ValueError("Encrypted data is too short")
-    
-    salt, encrypted_entry = encrypted_data[:SALT_LENGTH], encrypted_data[SALT_LENGTH:]
-    key = derive_key(password, salt)
-    f = Fernet(key)
-    return f.decrypt(encrypted_entry).decode()
+    def get_entry(self):
+        """Get journal entry from user with a nice command-line interface"""
+        print("\n=== New Journal Entry ===")
+        print("Type your entry below (Press Ctrl+D on Unix/Linux or Ctrl+Z on Windows when finished):")
+        print("----------------------------------------")
+        
+        lines = []
+        try:
+            while True:
+                line = input()
+                lines.append(line)
+        except EOFError:
+            pass
+        
+        return "\n".join(lines)
 
-@click.group()
-def cli():
-    pass
+    def encrypt_entry(self, text):
+        """Encrypt the journal entry"""
+        encrypted_data = self.cipher_suite.encrypt(text.encode())
+        return base64.b64encode(encrypted_data).decode()
 
-@cli.command()
-@click.option('--entry', prompt='Your journal entry', help='The journal entry to encrypt and upload.')
-@click.option('--password', prompt=True, hide_input=True, confirmation_prompt=True, help='Password for encryption.')
-def add(entry, password):
-    try:
-        encrypted_data = encrypt_entry(password, entry)
-        encrypted_entry_base64 = base64.b64encode(encrypted_data).decode()
+    def decrypt_entry(self, encrypted_text):
+        """Decrypt the journal entry"""
+        encrypted_data = base64.b64decode(encrypted_text.encode())
+        decrypted_data = self.cipher_suite.decrypt(encrypted_data)
+        return decrypted_data.decode()
 
-        new_page = notion.pages.create(
-            parent={"database_id": os.getenv("NOTION_DATABASE_ID")},
+    def create_block_chunks(self, encrypted_text):
+        """Split encrypted text into blocks that fit within Notion's limits"""
+        chunks = []
+        for i in range(0, len(encrypted_text), self.BLOCK_CHAR_LIMIT):
+            chunk = encrypted_text[i:i + self.BLOCK_CHAR_LIMIT]
+            chunks.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [
+                        {
+                            "type": "text",
+                            "text": {
+                                "content": chunk
+                            }
+                        }
+                    ]
+                }
+            })
+        return chunks
+
+    def save_to_notion(self, encrypted_text):
+        """Save the encrypted entry to Notion as a page with content in blocks"""
+        now = datetime.datetime.now()
+        
+        # First create the page with just the title
+        new_page = self.notion.pages.create(
+            parent={"database_id": self.database_id},
             properties={
-                "Title": {"title": [{"text": {"content": f"Journal Entry - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"}}]},
-                "Content": {"rich_text": [{"text": {"content": encrypted_entry_base64}}]}
+                "Title": {"title": [{"text": {"content": f"Journal Entry - {now.strftime('%Y-%m-%d %H:%M')}"}}]}
             }
         )
+        
+        # Split content into blocks
+        blocks = self.create_block_chunks(encrypted_text)
+        total_blocks = len(blocks)
+        
+        # Add blocks in batches of MAX_BLOCKS_PER_REQUEST
+        for i in range(0, total_blocks, self.MAX_BLOCKS_PER_REQUEST):
+            batch = blocks[i:i + self.MAX_BLOCKS_PER_REQUEST]
+            self.notion.blocks.children.append(
+                new_page["id"],
+                children=batch
+            )
+        
+        return total_blocks
 
-        click.echo(f'Entry added to Notion. Page ID: {new_page["id"]}')
-    except ValueError as ve:
-        click.echo(f"Validation error: {str(ve)}")
-    except Exception as e:
-        click.echo(f"An error occurred: {str(e)}")
-        click.echo(traceback.format_exc())
-
-@cli.command()
-@click.option('--password', prompt=True, hide_input=True, help='Password for decryption.')
-def list(password):
-    try:
-        pages = notion.databases.query(
-            database_id=os.getenv("NOTION_DATABASE_ID"),
-            sorts=[{"property": "Title", "direction": "descending"}]
-        ).get("results")
-
-        for page in pages:
-            title = page["properties"]["Title"]["title"][0]["text"]["content"]
-            encrypted_content_base64 = page["properties"]["Content"]["rich_text"][0]["text"]["content"]
-            encrypted_content = base64.b64decode(encrypted_content_base64)
+def get_password():
+    """Get password from user with confirmation"""
+    while True:
+        password = getpass("\nEnter your encryption password: ")
+        if len(password) < 8:
+            print("Password must be at least 8 characters long.")
+            continue
             
-            try:
-                decrypted_content = decrypt_entry(password, encrypted_content)
-                click.echo(f"\n{title}")
-                click.echo(f"Content: {decrypted_content[:50]}...")  # Show first 50 characters
-                click.echo(f"Page ID: {page['id']}")
-            except Exception as decrypt_error:
-                click.echo(f"Failed to decrypt entry '{title}': {str(decrypt_error)}")
+        confirm = getpass("Confirm your encryption password: ")
+        if password != confirm:
+            print("Passwords don't match. Please try again.")
+            continue
+            
+        return password
 
-    except Exception as e:
-        click.echo(f"An error occurred: {str(e)}")
-        click.echo(traceback.format_exc())
-
-@cli.command()
-@click.option('--page-id', prompt='Page ID', help='The ID of the page to read.')
-@click.option('--password', prompt=True, hide_input=True, help='Password for decryption.')
-def read(page_id, password):
+def main():
     try:
-        page = notion.pages.retrieve(page_id=page_id)
-        title = page["properties"]["Title"]["title"][0]["text"]["content"]
-        encrypted_content_base64 = page["properties"]["Content"]["rich_text"][0]["text"]["content"]
-        encrypted_content = base64.b64decode(encrypted_content_base64)
+        print("Welcome to Encrypted Journal")
+        print("============================")
+        print("Your entries will be encrypted with your password.")
+        print("Make sure to remember this password as it will be needed to decrypt your entries.")
         
-        decrypted_content = decrypt_entry(password, encrypted_content)
+        # Get password from user
+        password = get_password()
         
-        click.echo(f"\n{title}")
-        click.echo(f"Content:\n{decrypted_content}")
-
+        # Create journal instance with password
+        journal = EncryptedJournal(password)
+        
+        # Get the entry
+        entry = journal.get_entry()
+        
+        if entry.strip():
+            # Encrypt and save
+            encrypted_entry = journal.encrypt_entry(entry)
+            total_blocks = journal.save_to_notion(encrypted_entry)
+            
+            print(f"\nJournal entry saved successfully using {total_blocks} blocks!")
+            if total_blocks > 1:
+                print(f"(Entry was split into multiple blocks due to length)")
+            
+            # Verify decryption works
+            decrypted = journal.decrypt_entry(encrypted_entry)
+            if decrypted == entry:
+                print("Encryption verification successful!")
+            else:
+                print("Warning: Encryption verification failed!")
+        else:
+            print("\nNo entry provided. Exiting...")
+            
     except ValueError as ve:
-        click.echo(f"Validation error: {str(ve)}")
+        print(f"\nConfiguration Error: {str(ve)}")
+        print("Please check your .env file and try again.")
     except Exception as e:
-        click.echo(f"An error occurred: {str(e)}")
-        click.echo(traceback.format_exc())
+        print(f"\nError: {str(e)}")
+        print("Please check your configuration and try again.")
 
-if __name__ == '__main__':
-    cli()
+if __name__ == "__main__":
+    main()
